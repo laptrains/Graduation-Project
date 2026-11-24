@@ -61,7 +61,7 @@
 | 消息中间件 | EMQX 5.x（Docker） | `docker-compose.yml` |
 | Go MQTT 客户端 | paho.mqtt.golang | `common/mqtt` |
 | ESP32 固件 | Arduino 框架 + PubSubClient + ArduinoJson + ESP32Servo | `firmware/` |
-| 前端 | Vue 2 + Axios（SSE 用原生 `fetch` 读取流） | `vue-frontend/` |
+| 前端 | Vue 3 + Element Plus + Axios（SSE 用原生 `fetch` 读取流） | `vue-frontend/` |
 | 持久化 | MySQL 8（GORM + AutoMigrate）、Redis | `common/mysql`、`common/redis`、`dao/` |
 | 流式输出 | SSE（`http.Flusher` 逐帧 flush） | `service/session/` |
 | 摘要模型 | DeepSeek（OpenAI 兼容，独立于会话模型，未配置则降级） | `common/aihelper/summarizer.go` |
