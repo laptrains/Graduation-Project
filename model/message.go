@@ -14,6 +14,8 @@ type Message struct {
 }
 
 type History struct {
+	// ID 消息 ID，前端游标分页（加载更早消息）的锚点
+	ID      int64  `json:"id"`
 	IsUser  bool   `json:"is_user"`
 	Content string `json:"content"`
 }

@@ -20,6 +20,25 @@ var ctx = context.Background()
 // maxHistoryPageSize 历史消息单页最大条数
 const maxHistoryPageSize = 100
 
+// findSession 查询会话（包级变量，测试可替换）
+var findSession = session.FindSessionByID
+
+// checkSession 校验会话存在且归属指定用户，用于消息发送前的准入检查
+func checkSession(userName string, sessionID string) code.Code {
+	sess, err := findSession(ctx, sessionID)
+	if err != nil {
+		log.Println("checkSession FindSessionByID error:", err)
+		return code.CodeServerBusy
+	}
+	if sess == nil {
+		return code.CodeRecordNotFound
+	}
+	if sess.UserName != userName {
+		return code.CodeForbidden
+	}
+	return code.CodeSuccess
+}
+
 // GetUserSessionsByUserName 从 DB 查询用户的会话列表（不依赖内存中的 AIHelper，兼容懒加载）
 func GetUserSessionsByUserName(userName string) ([]model.SessionInfo, error) {
 	sessions, err := session.GetSessionsByUserName(userName)
@@ -87,6 +106,11 @@ func CreateStreamSessionOnly(userName string, userQuestion string) (string, code
 }
 
 func StreamMessageToExistingSession(userName string, sessionID string, userQuestion string, modelType string, writer http.ResponseWriter) code.Code {
+	// 会话必须存在且归属当前用户：避免向任意 sessionId 静默写孤儿消息
+	if c := checkSession(userName, sessionID); c != code.CodeSuccess {
+		return c
+	}
+
 	// 确保 writer 支持 Flush
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
@@ -162,6 +186,11 @@ func CreateStreamSessionAndSendMessage(userName string, userQuestion string, mod
 }
 
 func ChatSend(userName string, sessionID string, userQuestion string, modelType string) (string, code.Code) {
+	// 会话必须存在且归属当前用户：避免向任意 sessionId 静默写孤儿消息
+	if c := checkSession(userName, sessionID); c != code.CodeSuccess {
+		return "", c
+	}
+
 	//1：获取AIHelper
 	manager := aihelper.GetGlobalManager()
 	config := map[string]interface{}{
@@ -184,44 +213,59 @@ func ChatSend(userName string, sessionID string, userQuestion string, modelType 
 }
 
 // GetChatHistory 从 DB 查询会话历史（按时间升序）。
-// pageSize <= 0 时返回全部；否则 page=1 为最新的一页，page 越大越早。返回本页消息与消息总数。
-func GetChatHistory(reqCtx context.Context, userName string, sessionID string, page, pageSize int) ([]model.History, int64, code.Code) {
-	sess, err := session.FindSessionByID(reqCtx, sessionID)
+// pageSize <= 0 时返回全部；否则 page=1 为最新的一页，page 越大越早。
+// beforeID > 0 时走游标分页：返回 id < beforeID 的更早消息，翻页期间追加新消息不会造成重复或漏读。
+// 返回本页消息、消息总数与是否还有更早的消息。
+func GetChatHistory(reqCtx context.Context, userName string, sessionID string, page, pageSize int, beforeID int64) ([]model.History, int64, bool, code.Code) {
+	sess, err := findSession(reqCtx, sessionID)
 	if err != nil {
 		log.Println("GetChatHistory FindSessionByID error:", err)
-		return nil, 0, code.CodeServerBusy
+		return nil, 0, false, code.CodeServerBusy
 	}
 	if sess == nil {
-		return nil, 0, code.CodeRecordNotFound
+		return nil, 0, false, code.CodeRecordNotFound
 	}
 	if sess.UserName != userName {
-		return nil, 0, code.CodeForbidden
+		return nil, 0, false, code.CodeForbidden
 	}
 
 	total, err := message.CountBySessionID(reqCtx, sessionID)
 	if err != nil {
 		log.Println("GetChatHistory CountBySessionID error:", err)
-		return nil, 0, code.CodeServerBusy
+		return nil, 0, false, code.CodeServerBusy
+	}
+
+	if beforeID > 0 {
+		// 游标分页：以"已加载最早消息的 id"为锚点，不受新消息追加影响
+		if pageSize <= 0 || pageSize > maxHistoryPageSize {
+			pageSize = maxHistoryPageSize
+		}
+		msgs, err := message.ListBySessionIDBefore(reqCtx, sessionID, beforeID, pageSize)
+		if err != nil {
+			log.Println("GetChatHistory ListBySessionIDBefore error:", err)
+			return nil, 0, false, code.CodeServerBusy
+		}
+		history := make([]model.History, 0, len(msgs))
+		for _, msg := range msgs {
+			history = append(history, model.History{ID: int64(msg.ID), IsUser: msg.IsUser, Content: msg.Content})
+		}
+		// 取满一页时可能还有更早的消息（下次游标请求取到 0 条时自然终止）
+		return history, total, len(msgs) == pageSize, code.CodeSuccess
 	}
 
 	offset, limit := historyRange(int(total), page, pageSize)
 	history := make([]model.History, 0, limit)
-	if limit <= 0 {
-		return history, total, code.CodeSuccess
+	if limit > 0 {
+		msgs, err := message.ListBySessionIDRange(reqCtx, sessionID, offset, limit)
+		if err != nil {
+			log.Println("GetChatHistory ListBySessionIDRange error:", err)
+			return nil, 0, false, code.CodeServerBusy
+		}
+		for _, msg := range msgs {
+			history = append(history, model.History{ID: int64(msg.ID), IsUser: msg.IsUser, Content: msg.Content})
+		}
 	}
-
-	msgs, err := message.ListBySessionIDRange(reqCtx, sessionID, offset, limit)
-	if err != nil {
-		log.Println("GetChatHistory ListBySessionIDRange error:", err)
-		return nil, 0, code.CodeServerBusy
-	}
-	for _, msg := range msgs {
-		history = append(history, model.History{
-			IsUser:  msg.IsUser,
-			Content: msg.Content,
-		})
-	}
-	return history, total, code.CodeSuccess
+	return history, total, historyHasMore(int(total), page, pageSize), code.CodeSuccess
 }
 
 // historyRange 计算分页对应的 offset/limit（消息按 id 升序，page=1 为最新一页）
@@ -244,6 +288,22 @@ func historyRange(total, page, pageSize int) (int, int) {
 		return 0, end
 	}
 	return offset, pageSize
+}
+
+// historyHasMore 判断是否还有更早的历史页。
+// pageSize 必须先按 maxHistoryPageSize 截断再参与计算：controller 侧曾用原始请求值计算，
+// 导致 pageSize>100 时实际只返回 100 条却判定 hasMore=false，更早的历史永远翻不到
+func historyHasMore(total, page, pageSize int) bool {
+	if pageSize <= 0 {
+		return false
+	}
+	if pageSize > maxHistoryPageSize {
+		pageSize = maxHistoryPageSize
+	}
+	if page <= 0 {
+		page = 1
+	}
+	return page*pageSize < total
 }
 
 func ChatStreamSend(userName string, sessionID string, userQuestion string, modelType string, writer http.ResponseWriter) code.Code {

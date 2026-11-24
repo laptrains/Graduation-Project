@@ -25,6 +25,25 @@ func ListBySessionIDRange(ctx context.Context, sessionID string, offset, limit i
 	return msgs, err
 }
 
+// ListBySessionIDBefore 返回 id 小于 beforeID 的最多 limit 条消息（按 id 升序输出）。
+// 游标分页：以消息 id 为锚点，翻页期间会话追加新消息不会导致页间重复或漏读
+func ListBySessionIDBefore(ctx context.Context, sessionID string, beforeID int64, limit int) ([]model.Message, error) {
+	var msgs []model.Message
+	err := mysql.DB.WithContext(ctx).
+		Where("session_id = ? AND id < ?", sessionID, beforeID).
+		Order("id desc").
+		Limit(limit).
+		Find(&msgs).Error
+	if err != nil {
+		return nil, err
+	}
+	// 倒序取出后反转为升序，与 page 分页的返回顺序保持一致
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
 func GetMessagesBySessionID(sessionID string) ([]model.Message, error) {
 	var msgs []model.Message
 	err := mysql.DB.Where("session_id = ?", sessionID).Order("created_at asc").Find(&msgs).Error

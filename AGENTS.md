@@ -104,4 +104,7 @@ docker exec -it gopherai-mysql mysql -uroot -p20050302 Gopheral
 - 项目路径含括号 `GopherAI-v2(1)`，webpack 的 copy 插件 glob 会被当成 extglob 解析，`vue.config.js` 里已改成相对 glob，**不要改回去**。
 - 前端接口前缀是 `/api`，靠 devServer 代理重写到 `/api/v1`（`vue.config.js`）。生产构建的 `dist` 需要 nginx 把 `/api` 反代到 `:9090/api/v1`，后端不托管静态资源。
 - 历史接口分页语义：`page=1` 是**最新**一页，page 越大越早；不传 `pageSize` 返回全部。
-- 流式是 SSE：每行 `data: <chunk>`，结束 `data: [DONE]`；新会话第一帧是 `data: {"sessionId": "..."}`。
+- 历史接口**推荐游标分页**：传 `beforeId`（已加载最早消息的 id）返回更早的一页，每条 history 带 `id` 字段。`page` 翻页在加载期间有新消息追加时会重复/漏读，前端"加载更早"已改走 `beforeId`，不要改回 `page+1`。
+- `/chat/send`、`/chat/send-stream` 现在校验会话存在与归属：不存在的 `sessionId` 返回 `CodeRecordNotFound`（1004），不再是静默写孤儿消息。联调时造数请先建会话。
+- MCP 模式下工具发现失败**直接报错**（不降级为普通聊天），排查看后端日志 `[mcp]` 前缀。
+- 流式是 SSE：每行 `data: <chunk>`，结束 `data: [DONE]`；新会话第一帧是 `data: {"sessionId": "..."}`。前端把"未收到 `[DONE]` 就断开"视为传输中断，会保留部分内容并提示，属预期行为。

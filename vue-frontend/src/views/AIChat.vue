@@ -155,7 +155,9 @@ export default {
       page: 0,
       total: 0,
       hasMore: false,
-      loadingMore: false
+      loadingMore: false,
+      // 游标分页锚点：已加载最早消息的 id（0 表示尚未从后端拉取过）
+      cursorId: 0
     })
 
     const messagesArrayOf = (key) => {
@@ -165,9 +167,18 @@ export default {
     }
 
 
+    // 渲染前先做 HTML 转义：用户输入与模型输出都可能包含 <img onerror>、<script> 等标签，
+    // 不转义直接进 v-html 会形成存储型 XSS（历史消息读取时再次触发）
+    const escapeHtml = (text) => String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+
     const renderMarkdown = (text) => {
       if (!text && text !== '') return ''
-      return String(text)
+      return escapeHtml(text)
         .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
         .replace(/\*(.*?)\*/g, '<em>$1</em>')
         .replace(/`(.*?)`/g, '<code>$1</code>')
@@ -190,7 +201,8 @@ export default {
       }
     }
 
-    // 拉取指定页历史：page=1 为最新一页，page 越大越早
+    // 拉取指定页历史：page=1 为最新一页。同时记录游标锚点（本页最早消息的 id），
+    // 供"加载更早消息"走游标分页，避免翻页期间新消息追加导致页间重复/漏读
     const fetchHistoryPage = async (sid, page) => {
       const sess = sessions.value[sid]
       if (!sess) return null
@@ -203,15 +215,46 @@ export default {
         throw new Error((response.data && response.data.status_msg) || '获取历史失败')
       }
       const fetched = response.data.history.map(item => ({
+        id: Number(item.id || 0),
         role: item.is_user ? 'user' : 'assistant',
         content: item.content
       }))
+      // fetched 为升序，第一条是本页最早的消息
+      sess.cursorId = fetched.length ? fetched[0].id : 0
       // page>1 是更早的消息，拼接到头部
       sess.messages = page <= 1 ? fetched : [...fetched, ...sess.messages]
       sess.page = page
       sess.total = Number(response.data.total || 0)
       sess.hasMore = Boolean(response.data.hasMore)
       sess.loaded = true
+      return sess
+    }
+
+    // 游标分页：拉取 id < cursorId 的更早消息并拼到头部。
+    // 以消息 id 为锚点，翻页期间后台流式写入新消息不会造成重复或漏读
+    const fetchHistoryBefore = async (sid, beforeId) => {
+      const sess = sessions.value[sid]
+      if (!sess || !beforeId) return null
+      const response = await api.post('/AI/chat/history', {
+        sessionId: sid,
+        beforeId,
+        pageSize: HISTORY_PAGE_SIZE
+      })
+      if (!response.data || response.data.status_code !== 1000 || !Array.isArray(response.data.history)) {
+        throw new Error((response.data && response.data.status_msg) || '获取历史失败')
+      }
+      const fetched = response.data.history.map(item => ({
+        id: Number(item.id || 0),
+        role: item.is_user ? 'user' : 'assistant',
+        content: item.content
+      }))
+      // 防御：仅保留确实早于当前锚点的消息，杜绝任何来源的重复
+      const older = fetched.filter(m => m.id && m.id < beforeId)
+      if (older.length) {
+        sess.cursorId = older[0].id
+        sess.messages = [...older, ...sess.messages]
+      }
+      sess.hasMore = Boolean(response.data.hasMore)
       return sess
     }
 
@@ -319,7 +362,7 @@ export default {
       }
     }
 
-    // 向上翻页：加载更早的一页并保持滚动位置不跳动
+    // 向上翻页：以游标（最早消息 id）加载更早的一页并保持滚动位置不跳动
     const loadMoreHistory = async () => {
       const sess = currentSession.value
       if (!sess || !sess.hasMore || sess.loadingMore) return
@@ -330,7 +373,7 @@ export default {
 
       sess.loadingMore = true
       try {
-        await fetchHistoryPage(sess.id, sess.page + 1)
+        await fetchHistoryBefore(sess.id, sess.cursorId)
         await nextTick()
         if (el) el.scrollTop = el.scrollHeight - prevHeight + prevTop
       } catch (err) {
@@ -355,6 +398,22 @@ export default {
       }
       if (state.sessionKey === activeKey.value) {
         nextTick(() => scrollToBottom())
+      }
+    }
+
+    // 流被中断（连接断开 / 未收到 [DONE] 就 EOF）：保留已生成的部分内容并明确提示，
+    // 不能当作正常完成静默收尾（截断的回答会被误认为完整结果）
+    const handleInterruptedStream = (state) => {
+      if (streamState.value === state) streamState.value = null
+      const partial = state.content
+      if (partial) {
+        const arr = messagesArrayOf(state.sessionKey)
+        if (arr) arr.push({ role: 'assistant', content: partial })
+        const sess = state.sessionKey === 'temp' ? null : sessions.value[state.sessionKey]
+        if (sess) sess.total += 1
+        ElMessage.error('流式传输中断，已保留已生成内容')
+      } else {
+        ElMessage.error('流式连接中断，未收到任何内容')
       }
     }
 
@@ -511,27 +570,20 @@ export default {
           } catch (e) {
             // ignore
           }
+          finalizeStream(state, true)
+        } else {
+          // 连接在收到 [DONE] 之前就关闭（代理/后端/网络中断）：
+          // 视为中断而不是正常完成，截断的内容要明确提示
+          handleInterruptedStream(state)
         }
-
-        finalizeStream(state, true)
       } catch (err) {
         if (err && err.name === 'AbortError') {
           finalizeStream(state, false)
           return
         }
         console.error('Stream error:', err)
-        if (streamState.value === state) streamState.value = null
-        const partial = state.content
-        if (partial) {
-          // 已输出一部分：保留内容，避免回答凭空消失
-          const arr = messagesArrayOf(state.sessionKey)
-          if (arr) arr.push({ role: 'assistant', content: partial })
-          const sess = state.sessionKey === 'temp' ? null : sessions.value[state.sessionKey]
-          if (sess) sess.total += 1
-          ElMessage.error('流式传输中断，已保留已生成内容')
-        } else {
-          throw err // 没有内容则交给 sendMessage 回滚用户消息
-        }
+        if (!state.content) throw err // 没有内容则交给 sendMessage 回滚用户消息
+        handleInterruptedStream(state)
       } finally {
         if (streamAbort === controller) streamAbort = null
       }

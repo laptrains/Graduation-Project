@@ -45,6 +45,7 @@ type (
 		SessionID string `json:"sessionId,omitempty" binding:"required"` // 当前会话ID
 		Page      int    `json:"page"`                                   // 页码，1 为最新一页；不传默认 1
 		PageSize  int    `json:"pageSize"`                               // 每页条数，不传或 <=0 返回全部
+		BeforeID  int64  `json:"beforeId"`                               // 游标分页：已加载最早消息的 id，>0 时返回更早的消息
 	}
 	ChatHistoryResponse struct {
 		History []model.History `json:"history"`
@@ -178,19 +179,15 @@ func ChatHistory(c *gin.Context) {
 		c.JSON(http.StatusOK, res.CodeOf(code.CodeInvalidParams))
 		return
 	}
-	history, total, code_ := session.GetChatHistory(c.Request.Context(), userName, req.SessionID, req.Page, req.PageSize)
+	history, total, hasMore, code_ := session.GetChatHistory(c.Request.Context(), userName, req.SessionID, req.Page, req.PageSize, req.BeforeID)
 	if code_ != code.CodeSuccess {
 		c.JSON(http.StatusOK, res.CodeOf(code_))
 		return
 	}
 
-	page := req.Page
-	if page <= 0 {
-		page = 1
-	}
 	res.Success()
 	res.History = history
 	res.Total = total
-	res.HasMore = req.PageSize > 0 && int64(page*req.PageSize) < total
+	res.HasMore = hasMore
 	c.JSON(http.StatusOK, res)
 }
