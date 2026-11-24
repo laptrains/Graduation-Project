@@ -1,0 +1,36 @@
+# 环境变量（含密钥，勿提交；.env.example 需提交）
+.env
+.env.local
+
+# 本地运行配置（含数据库密码等，勿提交；config.toml.example 需提交）
+config/config.toml
+
+# AI 助手工作区数据
+.codebuddy/
+
+# 编译产物
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试与覆盖率输出
+*.test
+*.out
+coverage.txt
+
+# 前端依赖与构建产物
+vue-frontend/node_modules/
+vue-frontend/dist/
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+
+# 日志文件
+logs/

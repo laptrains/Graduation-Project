@@ -1,0 +1,63 @@
+# 本地开发环境：EMQX + MySQL + Redis
+# 启动：docker compose up -d
+# EMQX 控制台：http://127.0.0.1:18083  （默认账号 admin / public，首次登录需改密）
+services:
+  emqx:
+    image: emqx/emqx:5.8.6
+    container_name: gopherai-emqx
+    restart: unless-stopped
+    ports:
+      - "1883:1883"     # MQTT TCP
+      - "8083:8083"     # MQTT over WebSocket
+      - "18083:18083"   # Dashboard
+    environment:
+      EMQX_NODE__NAME: emqx@127.0.0.1
+    volumes:
+      - emqx-data:/opt/emqx/data
+      - emqx-log:/opt/emqx/log
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx", "ctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mysql:
+    image: mysql:8.0
+    container_name: gopherai-mysql
+    restart: unless-stopped
+    ports:
+      - "3307:3306"     # 宿主 3306 已被 WSL 原生 MySQL 占用
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-20050302}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-Gopheral}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD:-20050302}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: gopherai-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"     # 宿主 6379 已被 WSL 原生 Redis 占用
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  emqx-data:
+  emqx-log:
+  mysql-data:
+  redis-data:
