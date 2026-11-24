@@ -1,4 +1,4 @@
-// Package server 设备控制 MCP 工具层：把 pkg/device 的能力暴露为 list_devices / control_device 两个工具。
+// Package server 设备控制 MCP 工具层：把 pkg/device 的能力暴露为 list_devices / control_device / get_device_state 三个工具。
 package server
 
 import (
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -21,8 +22,9 @@ const (
 	ServerName    = "device-mcp-server"
 	ServerVersion = "1.0.0"
 
-	ToolListDevices   = "list_devices"
-	ToolControlDevice = "control_device"
+	ToolListDevices    = "list_devices"
+	ToolControlDevice  = "control_device"
+	ToolGetDeviceState = "get_device_state"
 
 	argDeviceID = "device_id"
 	argAction   = "action"
@@ -33,6 +35,10 @@ const (
 type Executor interface {
 	Execute(ctx context.Context, req device.Request) (device.Outcome, error)
 	Registry() *device.Registry
+	// DeviceState 设备最近一次上报的状态；ok=false 表示从未上报
+	DeviceState(deviceID string) (devproto.ActuatorStatus, bool)
+	// NodeState 节点在线状态，用于提示状态可能已过期
+	NodeState(nodeID string) device.NodeState
 }
 
 // New 创建注册了设备工具的 MCP Server
@@ -41,12 +47,13 @@ func New(exec Executor) *server.MCPServer {
 	h := &handlers{exec: exec}
 	s.AddTool(listDevicesTool(), h.listDevices)
 	s.AddTool(controlDeviceTool(exec.Registry()), h.controlDevice)
+	s.AddTool(getDeviceStateTool(exec.Registry()), h.getDeviceState)
 	return s
 }
 
 func listDevicesTool() mcp.Tool {
 	return mcp.NewTool(ToolListDevices,
-		mcp.WithDescription("列出所有可控设备：device_id、中文名称、别名、类型、支持的 action 及参数范围。不包含设备当前状态。"),
+		mcp.WithDescription("列出所有可控设备：device_id、中文名称、别名、类型、支持的 action 及参数范围。不包含设备当前状态，查询状态请使用 get_device_state。"),
 		mcp.WithReadOnlyHintAnnotation(true),
 	)
 }
@@ -92,6 +99,17 @@ func controlDescription(reg *device.Registry) string {
 	return b.String()
 }
 
+// getDeviceStateTool 查询设备当前状态（最近一次上报的执行结果/初始状态）
+func getDeviceStateTool(reg *device.Registry) mcp.Tool {
+	return mcp.NewTool(ToolGetDeviceState,
+		mcp.WithDescription("查询设备当前状态：返回最近一次上报的状态字段（如 power=on/off、angle）与上报时间。"+
+			"用户问灯是否开着、风扇状态、窗帘拉到多少等“查看状态”的请求时使用本工具；不要根据对话历史或之前的控制结果推断当前状态。"),
+		mcp.WithString(argDeviceID, mcp.Required(), mcp.Enum(reg.IDs()...), mcp.Description("目标设备 id")),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(true),
+	)
+}
+
 type handlers struct {
 	exec Executor
 }
@@ -102,6 +120,46 @@ func (h *handlers) listDevices(_ context.Context, _ mcp.CallToolRequest) (*mcp.C
 		return nil, fmt.Errorf("marshal devices: %w", err)
 	}
 	return mcp.NewToolResultText(string(b)), nil
+}
+
+// getDeviceState 查询设备当前状态（读缓存，不下发指令）
+func (h *handlers) getDeviceState(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := r.GetArguments()
+	id, _ := args[argDeviceID].(string)
+	dev, ok := h.exec.Registry().Get(id)
+	if id == "" || !ok {
+		return mcp.NewToolResultError(fmt.Sprintf("未知设备 %q，可用设备：%s", id, strings.Join(h.exec.Registry().IDs(), ", "))), nil
+	}
+	st, ok := h.exec.DeviceState(id)
+	if !ok {
+		// 非错误结果：明确说明没有状态记录，避免模型编造
+		return mcp.NewToolResultText(fmt.Sprintf("%s（%s）暂无状态上报记录：设备可能刚上线，或从未执行过操作，可通过 control_device 控制后查看",
+			dev.Name, dev.ID)), nil
+	}
+	text := fmt.Sprintf("%s（%s）当前状态：%s，上报于%s",
+		dev.Name, dev.ID, formatState(st.State), ageText(st.TS))
+	if h.exec.NodeState(dev.NodeID) == device.NodeOffline {
+		text += "；注意：设备节点当前已离线，以上是该设备最后一次上报的状态，可能已过期"
+	}
+	return mcp.NewToolResultText(text), nil
+}
+
+// ageText 上报时间的人性化描述
+func ageText(ts int64) string {
+	if ts <= 0 {
+		return "未知时间"
+	}
+	d := time.Since(time.Unix(ts, 0))
+	switch {
+	case d < 0:
+		return "刚刚"
+	case d < time.Minute:
+		return fmt.Sprintf(" %d 秒前", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf(" %d 分钟前", int(d.Minutes()))
+	default:
+		return time.Unix(ts, 0).Format("2006-01-02 15:04:05")
+	}
 }
 
 func (h *handlers) controlDevice(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
