@@ -1,12 +1,14 @@
-# 基于大语言模型与 MCP 协议的智能家居控制系统设计与实现
+# 基于大语言模型与 MCP 协议的智能家居控制系统（设计文档）
 
-> 版本：v4（软件部分已落地）
+> 版本：v5
+> 本文件只描述**系统架构与技术方案**：解决什么问题、用什么技术、协议怎么定、链路怎么走。
+> 开发进度、硬件实施、测试计划与分支约定见 [roadmap.md](roadmap.md)。
+>
 > 范围：只做**下行控制链路**——用户用自然语言下指令，LLM 通过 MCP 工具控制 ESP32 上的执行器。不做传感器数据采集、存储、告警与自动联动（模拟器会周期性上报传感器数据以贴合真实节点，但服务端不消费）。
-> 状态：后端、前端、MCP Server、模拟节点均已实现并完成联调；**ESP32 固件尚未实现**，当前由 `cmd/simulator` 顶替真实设备。
 
 ---
 
-## 一、解决什么问题
+## 一、问题与方案
 
 | 问题 | 解决方式 |
 | :--- | :--- |
@@ -21,20 +23,7 @@
 
 ---
 
-## 二、硬件清单（预算约 48 元）
-
-| 类别 | 器件 | 功能 | 接口 | 参考价 |
-| :--- | :--- | :--- | :--- | :--- |
-| 主控 | ESP32-WROOM / ESP32-S3 | WiFi 联网，接收指令并驱动执行器 | — | 约 20 元 |
-| 执行 | 继电器模块（2 路） | 控制灯、风扇的通断 | GPIO | 约 8 元 |
-| 执行 | SG90 舵机 | 窗帘开合（角度控制） | PWM | 约 10 元 |
-| 配件 | 面包板 + 杜邦线 | 接线 | — | 约 10 元 |
-
-> 灯只做开/关两态，不做调光。**器件尚未采购、固件未编写**，当前全部联调由 `cmd/simulator` 虚拟节点完成；固件落地后只需替换节点侧，后端零改动。
-
----
-
-## 三、术语
+## 二、术语
 
 | 术语 | 在本项目中的作用 |
 | :--- | :--- |
@@ -51,16 +40,16 @@
 
 ---
 
-## 四、技术选型
+## 三、技术选型
 
 | 模块 | 技术 | 位置 |
 | :--- | :--- | :--- |
 | Web 框架 | Gin | `router/`、`controller/` |
 | LLM 框架 | CloudWeGo Eino（OpenAI 兼容） | `common/aihelper` |
 | MCP | mark3labs/mcp-go v0.43（Streamable HTTP） | `common/mcp/server`、`common/mcp/client` |
-| 消息中间件 | EMQX 5.x（Docker） | `docker-compose.yml` |
+| 消息中间件 | EMQX 5.8（Docker） | `docker-compose.yml` |
 | Go MQTT 客户端 | paho.mqtt.golang | `common/mqtt` |
-| ESP32 固件 | Arduino 框架 + PubSubClient + ArduinoJson + ESP32Servo | `firmware/` |
+| ESP32 固件 | Arduino 框架 + PubSubClient + ArduinoJson + ESP32Servo | `firmware/`（待实现） |
 | 前端 | Vue 3 + Element Plus + Axios（SSE 用原生 `fetch` 读取流） | `vue-frontend/` |
 | 持久化 | MySQL 8（GORM + AutoMigrate）、Redis | `common/mysql`、`common/redis`、`dao/` |
 | 流式输出 | SSE（`http.Flusher` 逐帧 flush） | `service/session/` |
@@ -87,7 +76,44 @@ EMQX → ESP32
 
 ---
 
-## 五、开发规范
+## 四、系统架构与分层
+
+```mermaid
+flowchart LR
+    U[浏览器<br/>Vue 3] -->|"HTTP / SSE"| B[Go 后端<br/>Gin + Eino]
+    B -->|"Streamable HTTP<br/>JSON-RPC"| M[device-mcp-server<br/>独立进程]
+    M -->|"publish cmd<br/>QoS 1，不 Retain"| E[(EMQX)]
+    E -->|"下行指令"| D[ESP32 / simulator]
+    D -->|"status 回执<br/>带回 req_id"| E
+    E -->|"订阅 home/+/status"| M
+    B --> DB[(MySQL)]
+    B --> R[(Redis)]
+```
+
+代码分层：
+
+```
+router/ controller/ service/   HTTP 层：路由 → handler → 业务编排（含 SSE 写流）
+dao/ model/                    数据层：GORM 实体与 CRUD（session / message / digest / usermemory）
+pkg/devproto                   MQTT 协议定义（Topic、消息结构），模拟器 / MCP Server 共用
+pkg/device                     领域：设备注册表与参数校验、指令下发与回执匹配（Commander）
+pkg/memory                     领域：L1 窗口 + L2 摘要 + L3 长期记忆、上下文组装与预算（见 memory-design.md）
+common/mqtt                    MQTT 连接管理，实现 Publisher 接口
+common/messagewriter           消息异步批量落库（1024 缓冲 / 50 条 / 500ms）
+common/mcp/server              MCP 工具定义（list_devices、control_device）
+common/mcp/client              MCP 客户端，供 aihelper 调用
+common/aihelper                LLM 对话 + 多轮 Tool Calling + 会话管理（manager）
+cmd/device-mcp-server          MCP Server 进程入口
+cmd/simulator                  虚拟 ESP32 节点（含故障注入）
+cmd/mcp-cli / cmd/mcp-chat     联调工具：直接调用工具 / 命令行对话
+firmware/                      ESP32 固件（PlatformIO 工程）—— 待实现，目录尚未创建
+```
+
+**依赖方向**：`service → common/aihelper → pkg/memory → dao`；设备侧 `cmd/device-mcp-server → common/mcp/server → pkg/device → common/mqtt → pkg/devproto`。`pkg/memory` 通过 `Summarizer` 接口反向调用 LLM，避免循环 import。
+
+---
+
+## 五、通信协议与开发规范
 
 ### 1. MQTT Topic
 
@@ -133,27 +159,7 @@ home/{node_id}/data         上行：传感器上报（仅模拟器使用，服�
 | `control_device` | `device_id`（枚举）、`action`（枚举）、`angle`（选填，整数 0–180） | 下发指令，等待设备回执后返回真实结果与响应耗时 |
 
 > 参数采用扁平结构，便于 LLM 正确生成并在 schema 上约束取值；MCP Server 内部再转换为 MQTT 的 `params`。
-
-### 5. 代码分层
-
-```
-router/ controller/ service/   HTTP 层：路由 → handler → 业务编排（含 SSE 写流）
-dao/ model/                    数据层：GORM 实体与 CRUD（session / message / digest / usermemory）
-pkg/devproto                   MQTT 协议定义（Topic、消息结构），模拟器 / MCP Server 共用
-pkg/device                     领域：设备注册表与参数校验、指令下发与回执匹配（Commander）
-pkg/memory                     领域：L1 窗口 + L2 摘要 + L3 长期记忆、上下文组装与预算（见 memory-design.md）
-common/mqtt                    MQTT 连接管理，实现 Publisher 接口
-common/messagewriter           消息异步批量落库（1024 缓冲 / 50 条 / 500ms）
-common/mcp/server              MCP 工具定义（list_devices、control_device）
-common/mcp/client              MCP 客户端，供 aihelper 调用
-common/aihelper                LLM 对话 + 多轮 Tool Calling + 会话管理（manager）
-cmd/device-mcp-server          MCP Server 进程入口
-cmd/simulator                  虚拟 ESP32 节点（含故障注入）
-cmd/mcp-cli / cmd/mcp-chat     联调工具：直接调用工具 / 命令行对话
-firmware/                      ESP32 固件（PlatformIO 工程）—— 待实现，目录尚未创建
-```
-
-**依赖方向**：`service → common/aihelper → pkg/memory → dao`；`pkg/memory` 通过 `Summarizer` 接口反向调用 LLM，避免循环 import。
+> 工具清单由服务端注册表动态生成，客户端通过 `tools/list` 自动发现，新增设备不需要改提示词。
 
 ---
 
@@ -181,6 +187,7 @@ firmware/                      ESP32 固件（PlatformIO 工程）—— 待实�
 | 回执超时 | 返回"未收到确认，状态未知"，而不是"失败"（设备可能已执行） |
 | 设备离线 | 通过节点 Last Will 维护在线状态，离线时立即返回错误，不等超时；状态未知时照常下发 |
 | 非法参数 | schema 枚举/范围约束 + Server 端校验，以 MCP 工具错误返回，LLM 可读原因并修正 |
+| 模型幻觉 | 工具系统提示强制"设备状态变更必须先调 `control_device`，不得根据历史或工具描述推断成功" |
 | 时延统计 | 每次调用输出 `device_control` 结构化日志（`req_id`、`latency_ms`、`result`），供论文时延测试 |
 
 ---
@@ -202,35 +209,7 @@ firmware/                      ESP32 固件（PlatformIO 工程）—— 待实�
 
 ---
 
-## 八、开发阶段
-
-| 阶段 | 内容 | 状态 |
-| :--- | :--- | :--- |
-| 1 | 环境：Docker 启动 EMQX，模拟器连上 Broker | ✅ 已完成 |
-| 2 | MCP Server：两个工具、`req_id` 回执匹配、离线快速失败、超时语义 | ✅ 已完成，Inspector / `mcp-cli` 直连可控模拟器设备 |
-| 3 | aihelper 接入：原生 Tool Calling + `tools/list` 自动发现 + 多轮（上限 5 轮）+ 流式 | ✅ 已完成 |
-| 4 | 前端对话控制页：SSE 流式渲染、会话列表、分页历史、控制模式切换 | ✅ 已完成 |
-| 5 | 会话记忆：L1 窗口 + L2 滚动摘要 + L3 长期记忆、懒加载 | ✅ 已完成 |
-| 6 | ESP32 固件：继电器 + 舵机 + Last Will | ⏳ 未开始（无硬件，由 simulator 顶替） |
-| 7 | 测试与论文：功能测试、响应时延、意图识别准确率 | ⏳ 待进行 |
-
-> **软件部分（后端 + 前端 + MCP Server + 模拟节点）已全部完成，端到端链路可复现**；硬件章节保持原设计，固件落地后仅替换节点侧。
-> 注：`openspec/changes/add-device-mcp-server/tasks.md` 的勾选尚未补全，但代码与端到端验证已完成，以其勾选状态判断进度会失真。
-
----
-
-## 九、开源准备
-
-| 项 | 要求 |
-| :--- | :--- |
-| 配置外置 | 明文密钥移到 `.env`，提供 `.env.example` |
-| 一键启动 | `docker compose up -d` 启动 EMQX（MySQL / Redis 同为容器） |
-| 固件 | `firmware/` 下 PlatformIO 工程，README 附接线表（**待实现**） |
-| README | 架构图、快速开始、MCP 工具列表、演示截图 |
-
----
-
-## 十、联调与测试工具
+## 八、联调与测试工具
 
 | 工具 | 作用 | 用法 |
 | :--- | :--- | :--- |
@@ -240,3 +219,16 @@ firmware/                      ESP32 固件（PlatformIO 工程）—— 待实�
 | MCP Inspector | 第三方客户端，验证工具可被外部复用 | 连接 `http://localhost:8081/mcp` |
 
 > 端口约定、进程清理与常见坑见 `AGENTS.md`；判断工具行为一律用 `mcp-cli`，不要看聊天界面的二次包装话术。
+> 具体测试项、指标口径与验收标准见 [roadmap.md](roadmap.md)。
+
+---
+
+## 九、相关文档
+
+| 文档 | 内容 |
+| :--- | :--- |
+| [roadmap.md](roadmap.md) | 开发路线图：状态、里程碑、硬件计划、测试方案、分支约定 |
+| [memory-design.md](memory-design.md) | 三层记忆模块设计（字段级） |
+| [openspec/](openspec) | 能力规格与变更提案 |
+| [AGENTS.md](AGENTS.md) | 端口、进程清理与联调踩坑记录 |
+| [README.md](README.md) | 快速开始与工具清单 |

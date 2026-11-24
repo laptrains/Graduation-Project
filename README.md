@@ -177,7 +177,8 @@ firmware/                  ESP32 固件（待实现）
 
 ## 相关文档
 
-- [design.md](design.md)：系统设计、协议、开发阶段
+- [design.md](design.md)：系统架构、技术选型、通信协议、控制链路
+- [roadmap.md](roadmap.md)：开发路线图、里程碑、硬件计划、测试方案
 - [memory-design.md](memory-design.md)：三层记忆模块设计
 - [openspec/](openspec)：能力规格与变更提案
 - [AGENTS.md](AGENTS.md)：端口约定、进程清理与联调踩坑记录
