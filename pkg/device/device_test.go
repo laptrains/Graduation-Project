@@ -346,6 +346,62 @@ func TestCommander_NodeStatusWithoutOnlineFieldIgnored(t *testing.T) {
 	}
 }
 
+// 设备状态缓存：模拟器初始状态（无 req_id）与控制回执都应更新缓存，供 get_device_state 查询
+func TestCommander_DeviceStateCached(t *testing.T) {
+	var c *Commander
+	pub := &fakePublisher{}
+	pub.reply = echoReply(&c, 0)
+	c = newTestCommander(pub, io.Discard, time.Second)
+
+	// 未上报过：无记录
+	if _, ok := c.DeviceState(devproto.DeviceLight); ok {
+		t.Fatal("expect no state before any status message")
+	}
+
+	// 模拟器上线时发布的初始状态（req_id 为空）也应进入缓存
+	c.HandleStatus(devproto.StatusTopic(devproto.DeviceLight), statusPayload(devproto.ActuatorStatus{
+		DeviceID: devproto.DeviceLight, Success: true, State: map[string]any{"power": "off"}, TS: 100,
+	}))
+	st, ok := c.DeviceState(devproto.DeviceLight)
+	if !ok || st.State["power"] != "off" || st.TS != 100 {
+		t.Fatalf("initial status should be cached, got %+v ok=%v", st, ok)
+	}
+
+	// 控制回执更新缓存
+	if _, err := c.Execute(context.Background(), Request{DeviceID: devproto.DeviceLight, Action: devproto.ActionOn}); err != nil {
+		t.Fatal(err)
+	}
+	st, ok = c.DeviceState(devproto.DeviceLight)
+	if !ok || st.State["power"] != "on" {
+		t.Fatalf("control ack should update cache, got %+v ok=%v", st, ok)
+	}
+}
+
+// 错设备/异常回执不得污染状态缓存
+func TestCommander_DeviceStateNotPoisonedByMismatchedStatus(t *testing.T) {
+	var c *Commander
+	pub := &fakePublisher{}
+	pub.reply = echoReply(&c, 0)
+	c = newTestCommander(pub, io.Discard, time.Second)
+
+	c.HandleStatus(devproto.StatusTopic(devproto.DeviceLight), statusPayload(devproto.ActuatorStatus{
+		DeviceID: devproto.DeviceLight, Success: true, State: map[string]any{"power": "off"}, TS: 100,
+	}))
+	// payload 声称的 device_id 与 topic 不一致：整条消息不可信，不更新缓存
+	c.HandleStatus(devproto.StatusTopic(devproto.DeviceLight), statusPayload(devproto.ActuatorStatus{
+		DeviceID: devproto.DeviceFan, Success: true, State: map[string]any{"power": "on"}, TS: 200,
+	}))
+	st, _ := c.DeviceState(devproto.DeviceLight)
+	if st.State["power"] != "off" || st.TS != 100 {
+		t.Fatalf("mismatched status must not update cache, got %+v", st)
+	}
+
+	// 未注册设备不缓存（HandleStatus 外层已过滤，这里验证防御语义）
+	if _, ok := c.DeviceState("tv"); ok {
+		t.Fatal("unregistered device must have no state")
+	}
+}
+
 // #6 同 ClientID 重连后，旧连接迟到的遗嘱不得覆盖新连接的在线状态
 func TestCommander_StaleWillFromOldConnectionIgnored(t *testing.T) {
 	var c *Commander

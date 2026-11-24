@@ -108,6 +108,7 @@ go run ./cmd/simulator             # 虚拟 ESP32 节点 esp32_01
 |---|---|---|
 | `list_devices` | 无 | 列出可控设备：名称、中文别名、支持的 action 与参数范围 |
 | `control_device` | `device_id`（枚举）、`action`（枚举）、`angle`（整数 0–180，选填） | 下发指令并等待回执，返回真实结果与设备响应耗时 |
+| `get_device_state` | `device_id`（枚举） | 查询设备当前状态（最近一次上报的状态与上报时间）；节点离线时提示状态可能已过期 |
 
 参数为扁平结构，取值在 JSON Schema 上做枚举与范围约束，服务端二次校验。
 
@@ -125,6 +126,7 @@ go run ./cmd/simulator             # 虚拟 ESP32 节点 esp32_01
 go run ./cmd/mcp-cli tools                              # 列出工具
 go run ./cmd/mcp-cli list                               # 列出设备
 go run ./cmd/mcp-cli control relay_light on             # 控制设备
+go run ./cmd/mcp-cli state relay_light                  # 查看设备当前状态
 go run ./cmd/mcp-cli -url http://localhost:18081/mcp control servo_curtain set_angle 90
 ```
 

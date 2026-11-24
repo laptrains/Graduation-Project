@@ -30,7 +30,7 @@ const (
 func main() {
 	url := flag.String("url", defaultURL, "MCP Server 地址")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: mcp-cli [-url URL] tools | list | control <device_id> <action> [angle]")
+		fmt.Fprintln(os.Stderr, "usage: mcp-cli [-url URL] tools | list | state <device_id> | control <device_id> <action> [angle]")
 	}
 	flag.Parse()
 	if flag.NArg() == 0 {
@@ -69,6 +69,11 @@ func run(url string, args []string) error {
 		return nil
 	case "list":
 		return callAndPrint(ctx, c, "list_devices", nil)
+	case "state":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: state <device_id>")
+		}
+		return callAndPrint(ctx, c, "get_device_state", map[string]any{"device_id": args[1]})
 	case "control":
 		if len(args) < minControlArgs {
 			return fmt.Errorf("usage: control <device_id> <action> [angle]")

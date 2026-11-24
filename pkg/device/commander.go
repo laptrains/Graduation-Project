@@ -61,6 +61,8 @@ type Commander struct {
 	mu      sync.Mutex
 	pending map[string]*pendingReq
 	nodes   map[string]nodeEntry
+	// states 每个设备的最新状态（初始状态上报与控制回执都会刷新），供 get_device_state 查询
+	states map[string]devproto.ActuatorStatus
 }
 
 // CommanderOption 可选配置
@@ -95,6 +97,7 @@ func NewCommander(reg *Registry, pub Publisher, opts ...CommanderOption) *Comman
 		newID:   uuid.NewString,
 		pending: map[string]*pendingReq{},
 		nodes:   map[string]nodeEntry{},
+		states:  map[string]devproto.ActuatorStatus{},
 	}
 	for _, o := range opts {
 		o(c)
@@ -236,15 +239,31 @@ func (c *Commander) handleNode(id string, payload []byte) {
 	c.logger.Info("node_status", "node", id, "state", string(state), "reason", st.Reason)
 }
 
-// handleActuator 校验回执来源设备后投递给挂起请求；topic 与 payload 任一不匹配即丢弃
+// handleActuator 刷新设备最新状态缓存，并把带回 req_id 的执行回执投递给挂起请求；
+// topic 与 payload 任一设备不匹配即整条丢弃
 func (c *Commander) handleActuator(topicID string, payload []byte) {
 	var st devproto.ActuatorStatus
-	if err := json.Unmarshal(payload, &st); err != nil || st.ReqID == "" {
+	if err := json.Unmarshal(payload, &st); err != nil {
 		return
 	}
+	if st.DeviceID != "" && st.DeviceID != topicID {
+		// payload 声称的 device_id 与 topic 不一致：整条消息不可信，不更新缓存也不投递
+		c.logger.Warn("drop status with mismatched device_id",
+			"topic_device", topicID, "payload_device", st.DeviceID, "req_id", st.ReqID)
+		return
+	}
+
 	c.mu.Lock()
+	// 初始状态上报（req_id 为空）与执行回执都刷新最新状态；device_id 以 topic 为准
+	st.DeviceID = topicID
+	c.states[topicID] = st
 	req, ok := c.pending[st.ReqID]
 	c.mu.Unlock()
+
+	if st.ReqID == "" {
+		// 初始状态上报，无需投递
+		return
+	}
 	if !ok {
 		// 不在挂起表：请求已超时/已结束，或为 Retain 旧回执，一律丢弃
 		c.logger.Info("drop unmatched status",
@@ -257,14 +276,19 @@ func (c *Commander) handleActuator(topicID string, payload []byte) {
 			"topic_device", topicID, "expected_device", req.deviceID, "req_id", st.ReqID)
 		return
 	}
-	if st.DeviceID != "" && st.DeviceID != topicID {
-		// payload 声称的 device_id 与 topic 不一致
-		c.logger.Warn("drop status with mismatched device_id",
-			"topic_device", topicID, "payload_device", st.DeviceID, "req_id", st.ReqID)
-		return
-	}
 	select {
 	case req.ch <- st:
 	default:
 	}
+}
+
+// DeviceState 返回设备最近一次上报的状态（初始状态或执行回执）；设备未注册或从未上报时 ok=false
+func (c *Commander) DeviceState(deviceID string) (devproto.ActuatorStatus, bool) {
+	if _, ok := c.reg.Get(deviceID); !ok {
+		return devproto.ActuatorStatus{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st, ok := c.states[deviceID]
+	return st, ok
 }

@@ -81,7 +81,7 @@ func TestToolsList(t *testing.T) {
 	for _, tl := range tools {
 		names[tl.Name] = tl
 	}
-	if len(tools) != 2 || names[ToolListDevices].Name == "" || names[ToolControlDevice].Name == "" {
+	if len(tools) != 3 || names[ToolListDevices].Name == "" || names[ToolControlDevice].Name == "" || names[ToolGetDeviceState].Name == "" {
 		t.Fatalf("unexpected tools: %v", tools)
 	}
 
@@ -102,6 +102,13 @@ func TestToolsList(t *testing.T) {
 		if !strings.Contains(ctl.Description, alias) {
 			t.Errorf("description missing alias %s", alias)
 		}
+	}
+
+	// get_device_state：device_id 必填且带枚举
+	gs := names[ToolGetDeviceState]
+	gsSchema, _ := json.Marshal(gs.InputSchema)
+	if !strings.Contains(string(gsSchema), `"enum":["relay_light","relay_fan","servo_curtain"]`) {
+		t.Errorf("get_device_state schema missing device enum: %s", gsSchema)
 	}
 }
 
@@ -149,5 +156,65 @@ func TestControlDevice_ValidationIsToolError(t *testing.T) {
 	}
 	if len(pub.published) != 0 {
 		t.Fatalf("invalid calls must not publish, got %d", len(pub.published))
+	}
+}
+
+func callState(t *testing.T, c *client.MCPClient, deviceID string) *mcp.CallToolResult {
+	t.Helper()
+	res, err := c.CallTool(context.Background(), ToolGetDeviceState, map[string]any{argDeviceID: deviceID})
+	if err != nil {
+		t.Fatalf("call get_device_state: %v", err)
+	}
+	return res
+}
+
+// 查询设备状态：未上报过 → 明确说明；控制后 → 返回缓存的最新状态
+func TestGetDeviceState(t *testing.T) {
+	c, _ := setup(t)
+
+	// 从未上报过状态：正常结果（非错误）但明确说明没有记录，模型不得编造状态
+	res := callState(t, c, devproto.DeviceLight)
+	text := client.ResultText(res)
+	if res.IsError || !strings.Contains(text, "暂无状态上报") {
+		t.Fatalf("no-record state should explain itself, got %q isError=%v", text, res.IsError)
+	}
+
+	// 控制后状态被缓存
+	call(t, c, map[string]any{argDeviceID: devproto.DeviceLight, argAction: devproto.ActionOn})
+	res = callState(t, c, devproto.DeviceLight)
+	text = client.ResultText(res)
+	if res.IsError || !strings.Contains(text, "power=on") {
+		t.Fatalf("want power=on after control, got %q", text)
+	}
+
+	// 窗帘角度
+	call(t, c, map[string]any{argDeviceID: devproto.DeviceCurtain, argAction: devproto.ActionSetAngle, argAngle: 90})
+	res = callState(t, c, devproto.DeviceCurtain)
+	if text := client.ResultText(res); res.IsError || !strings.Contains(text, "angle=90") {
+		t.Fatalf("want angle=90, got %q", text)
+	}
+
+	// 未知设备 → tool error
+	res = callState(t, c, "tv")
+	if !res.IsError {
+		t.Fatalf("unknown device should be tool error, got %q", client.ResultText(res))
+	}
+}
+
+// 节点离线时查询状态要提示"可能已过期"，不得让用户误以为状态是实时的
+func TestGetDeviceStateOfflineWarning(t *testing.T) {
+	c, pub := setup(t)
+
+	call(t, c, map[string]any{argDeviceID: devproto.DeviceLight, argAction: devproto.ActionOn})
+	// 节点离线
+	pub.cmd.HandleStatus(devproto.StatusTopic(devproto.NodeESP32), []byte(`{"online":false,"reason":"unexpected_disconnect"}`))
+
+	res := callState(t, c, devproto.DeviceLight)
+	text := client.ResultText(res)
+	if res.IsError || !strings.Contains(text, "power=on") {
+		t.Fatalf("cached state should still be returned, got %q", text)
+	}
+	if !strings.Contains(text, "离线") {
+		t.Fatalf("offline node should be flagged, got %q", text)
 	}
 }

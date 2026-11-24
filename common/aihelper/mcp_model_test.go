@@ -514,7 +514,7 @@ func TestMCPModelDiscoversRealDeviceTools(t *testing.T) {
 	if _, err := m.GenerateResponse(ctx, []*schema.Message{schema.UserMessage("有哪些设备")}); err != nil {
 		t.Fatalf("GenerateResponse: %v", err)
 	}
-	if len(llm.bound) != 2 {
+	if len(llm.bound) != 3 {
 		t.Fatalf("unexpected discovered tools: %+v", llm.bound)
 	}
 	byName := map[string]*schema.ToolInfo{}
@@ -522,7 +522,7 @@ func TestMCPModelDiscoversRealDeviceTools(t *testing.T) {
 		byName[info.Name] = info
 	}
 	control, ok := byName["control_device"]
-	if !ok || byName["list_devices"] == nil {
+	if !ok || byName["list_devices"] == nil || byName["get_device_state"] == nil {
 		t.Fatalf("unexpected discovered tools: %+v", byName)
 	}
 	js, err := control.ParamsOneOf.ToJSONSchema()

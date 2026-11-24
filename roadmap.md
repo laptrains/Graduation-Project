@@ -11,7 +11,7 @@
 | :--- | :--- | :--- |
 | MQTT 环境与协议定义 | ✅ 完成 | EMQX 5.8（Docker）、`pkg/devproto` |
 | 设备控制链路 | ✅ 完成 | 参数校验、`req_id` 回执匹配、离线快速失败、超时语义 |
-| MCP Server / Client | ✅ 完成 | `list_devices`、`control_device`，Streamable HTTP |
+| MCP Server / Client | ✅ 完成 | `list_devices`、`control_device`、`get_device_state`，Streamable HTTP |
 | LLM 接入（Tool Calling） | ✅ 完成 | `tools/list` 自动发现、多轮（上限 5）、流式、失败降级 |
 | Web 后端 | ✅ 完成 | 会话、历史分页、同步与 SSE 流式接口 |
 | 前端对话页 | ✅ 完成 | 会话列表、流式渲染、控制模式切换 |
@@ -74,6 +74,7 @@
 
 ## 四、测试计划
 
+
 ### 1. 功能测试
 
 | 编号 | 测试项 | 方法 | 通过标准 |
@@ -89,6 +90,7 @@
 | T9 | 长会话记忆 | 连续对话 50 轮以上 | 注入上下文规模保持稳定，不随轮数增长 |
 | T10 | 流式首帧 | 新会话流式提问 | 首帧为 `{"sessionId": "..."}`，结束为 `data: [DONE]` |
 | T11 | MCP 不可用降级 | 关闭 MCP Server 后聊天 | 降级为普通对话，不报错卡死 |
+| T12 | 查看设备状态 | 先 `control` 一次，再 `mcp-cli state relay_light`；另测从未上报的设备 | 返回最近状态与上报时间；无记录时明确说"暂无状态记录"，不编造 |
 
 ### 2. 性能指标
 
