@@ -321,7 +321,8 @@ func TestMCPModelStreamCallsToolThenStreamsFinal(t *testing.T) {
 	}
 }
 
-func TestMCPModelDiscoveryFailureFallsBackToPlainLLM(t *testing.T) {
+// #1 工具发现失败必须显式报错：不允许静默降级为普通聊天，否则设备控制模式会"未执行却回答成功"
+func TestMCPModelDiscoveryFailureReturnsError(t *testing.T) {
 	llm := &fakeToolLLM{}
 	llm.gen = func(_ int, _ []*schema.Message) (*schema.Message, error) {
 		return schema.AssistantMessage("直接回答", nil), nil
@@ -329,15 +330,15 @@ func TestMCPModelDiscoveryFailureFallsBackToPlainLLM(t *testing.T) {
 	c := &fakeMCPToolClient{listErr: errors.New("connection refused")}
 	m := newTestMCPModel(llm, c)
 
-	got, err := m.GenerateResponse(context.Background(), []*schema.Message{schema.UserMessage("你好")})
-	if err != nil {
-		t.Fatalf("GenerateResponse should degrade gracefully: %v", err)
+	_, err := m.GenerateResponse(context.Background(), []*schema.Message{schema.UserMessage("开灯")})
+	if err == nil {
+		t.Fatal("GenerateResponse should fail loudly when tool discovery fails, got nil")
 	}
-	if got.Content != "直接回答" {
-		t.Fatalf("unexpected content: %q", got.Content)
+	if !strings.Contains(err.Error(), "MCP") {
+		t.Fatalf("error should mention MCP, got %q", err.Error())
 	}
-	if c.listCalls != 1 {
-		t.Fatalf("discovery should be attempted once, got %d", c.listCalls)
+	if len(llm.seen) != 0 {
+		t.Fatalf("LLM must not be called when discovery fails, got %d calls", len(llm.seen))
 	}
 	if len(llm.bound) != 0 {
 		t.Fatalf("tools should not be bound when discovery fails: %+v", llm.bound)
@@ -345,8 +346,41 @@ func TestMCPModelDiscoveryFailureFallsBackToPlainLLM(t *testing.T) {
 	if len(c.calls) != 0 {
 		t.Fatalf("no tool call expected: %+v", c.calls)
 	}
-	if len(llm.seen[0]) != 1 || llm.seen[0][0].Role != schema.User {
-		t.Fatalf("messages should be passed through unchanged: %+v", llm.seen[0])
+}
+
+// #1 流式路径同样不允许静默降级
+func TestMCPModelStreamDiscoveryFailureReturnsError(t *testing.T) {
+	llm := &fakeToolLLM{}
+	llm.stream = func(_ int, _ []*schema.Message) []*schema.Message {
+		return []*schema.Message{schema.AssistantMessage("直接回答", nil)}
+	}
+	c := &fakeMCPToolClient{listErr: errors.New("connection refused")}
+	m := newTestMCPModel(llm, c)
+
+	var chunks []string
+	_, err := m.StreamResponse(context.Background(), []*schema.Message{schema.UserMessage("开灯")}, func(s string) {
+		chunks = append(chunks, s)
+	})
+	if err == nil {
+		t.Fatal("StreamResponse should fail loudly when tool discovery fails, got nil")
+	}
+	if len(llm.seen) != 0 {
+		t.Fatalf("LLM must not be called when discovery fails, got %d calls", len(llm.seen))
+	}
+	if len(chunks) != 0 {
+		t.Fatalf("no chunk should reach the client, got %v", chunks)
+	}
+}
+
+// #1 工具列表为空同样视为 MCP 服务异常
+func TestMCPModelNoToolsReturnsError(t *testing.T) {
+	llm := &fakeToolLLM{}
+	c := &fakeMCPToolClient{tools: nil}
+	m := newTestMCPModel(llm, c)
+
+	_, err := m.GenerateResponse(context.Background(), []*schema.Message{schema.UserMessage("开灯")})
+	if err == nil {
+		t.Fatal("GenerateResponse should fail when MCP server exposes no tools")
 	}
 }
 

@@ -281,3 +281,91 @@ func TestCommander_ContextCanceled(t *testing.T) {
 		t.Fatalf("want ctx error, got %v", err)
 	}
 }
+
+// #5 回执必须来自目标设备：其他设备的 status 即使带回相同 req_id 也不能满足当前请求
+func TestCommander_StatusFromWrongDeviceDoesNotSatisfyRequest(t *testing.T) {
+	var c *Commander
+	pub := &fakePublisher{}
+	// 灯的指令，但回执发布到风扇的 status topic，且 req_id 相同
+	pub.reply = func(cmd devproto.Command) {
+		c.HandleStatus(devproto.StatusTopic(devproto.DeviceFan), statusPayload(devproto.ActuatorStatus{
+			DeviceID: devproto.DeviceFan, ReqID: cmd.ReqID, Success: true,
+			State: map[string]any{"power": "on"},
+		}))
+	}
+	c = newTestCommander(pub, io.Discard, 150*time.Millisecond)
+
+	start := time.Now()
+	_, err := c.Execute(context.Background(), Request{DeviceID: devproto.DeviceLight, Action: devproto.ActionOn})
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("wrong-device status must not satisfy request, want ErrTimeout, got %v", err)
+	}
+	if time.Since(start) < 150*time.Millisecond {
+		t.Fatalf("request should wait for the real device, returned early after %v", time.Since(start))
+	}
+}
+
+// #5 回执 payload 声称的 device_id 与 topic 不一致时也应丢弃
+func TestCommander_StatusPayloadDeviceMismatchIgnored(t *testing.T) {
+	var c *Commander
+	pub := &fakePublisher{}
+	pub.reply = func(cmd devproto.Command) {
+		// topic 是灯的，payload 却声称是风扇的回执
+		c.HandleStatus(devproto.StatusTopic(cmd.DeviceID), statusPayload(devproto.ActuatorStatus{
+			DeviceID: devproto.DeviceFan, ReqID: cmd.ReqID, Success: true,
+			State: map[string]any{"power": "on"},
+		}))
+	}
+	c = newTestCommander(pub, io.Discard, 150*time.Millisecond)
+
+	_, err := c.Execute(context.Background(), Request{DeviceID: devproto.DeviceLight, Action: devproto.ActionOn})
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("payload device mismatch must be ignored, want ErrTimeout, got %v", err)
+	}
+}
+
+// #6 合法 JSON 但缺 online 字段时，不能把节点误判为离线
+func TestCommander_NodeStatusWithoutOnlineFieldIgnored(t *testing.T) {
+	var c *Commander
+	pub := &fakePublisher{}
+	pub.reply = echoReply(&c, 0)
+	c = newTestCommander(pub, io.Discard, time.Second)
+	nodeTopic := devproto.StatusTopic(devproto.NodeESP32)
+
+	c.HandleStatus(nodeTopic, []byte(`{"online":true,"conn":"c1"}`))
+	c.HandleStatus(nodeTopic, []byte(`{}`))
+	c.HandleStatus(nodeTopic, []byte(`{"devices":["relay_light"],"ts":123}`))
+	if got := c.NodeState(devproto.NodeESP32); got != NodeOnline {
+		t.Fatalf("status without online field must not flip node offline, got %s", got)
+	}
+
+	// 正常的离线消息仍然生效
+	c.HandleStatus(nodeTopic, []byte(`{"online":false,"reason":"unexpected_disconnect","conn":"c1"}`))
+	if got := c.NodeState(devproto.NodeESP32); got != NodeOffline {
+		t.Fatalf("normal offline message should apply, got %s", got)
+	}
+}
+
+// #6 同 ClientID 重连后，旧连接迟到的遗嘱不得覆盖新连接的在线状态
+func TestCommander_StaleWillFromOldConnectionIgnored(t *testing.T) {
+	var c *Commander
+	pub := &fakePublisher{}
+	pub.reply = echoReply(&c, 0)
+	c = newTestCommander(pub, io.Discard, time.Second)
+	nodeTopic := devproto.StatusTopic(devproto.NodeESP32)
+
+	// 旧连接上线，随后新连接（相同 ClientID）上线
+	c.HandleStatus(nodeTopic, []byte(`{"online":true,"conn":"old"}`))
+	c.HandleStatus(nodeTopic, []byte(`{"online":true,"conn":"new"}`))
+	// 旧连接的遗嘱迟到到达：不得把节点标记为离线
+	c.HandleStatus(nodeTopic, []byte(`{"online":false,"reason":"unexpected_disconnect","conn":"old"}`))
+	if got := c.NodeState(devproto.NodeESP32); got != NodeOnline {
+		t.Fatalf("stale will must not override new connection online, got %s", got)
+	}
+
+	// 新连接自己的遗嘱仍然生效
+	c.HandleStatus(nodeTopic, []byte(`{"online":false,"reason":"unexpected_disconnect","conn":"new"}`))
+	if got := c.NodeState(devproto.NodeESP32); got != NodeOffline {
+		t.Fatalf("current connection will should apply, got %s", got)
+	}
+}

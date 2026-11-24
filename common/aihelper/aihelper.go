@@ -56,6 +56,16 @@ func (a *AIHelper) SetSaveFunc(saveFunc func(*model.Message) (*model.Message, er
 	a.saveFunc = saveFunc
 }
 
+// ModelType 返回当前绑定的模型类型（用于缓存命中判断，切换模式时需重建 helper）
+func (a *AIHelper) ModelType() string { return a.model.GetModelType() }
+
+// Close 释放 helper 持有的资源（如 MCP 客户端连接）；不释放会影响替换/移除后的连接
+func (a *AIHelper) Close() {
+	if c, ok := a.model.(interface{ Close() }); ok {
+		c.Close()
+	}
+}
+
 // GetMessages 获取当前近期窗口的消息快照（不含已被摘要的历史，完整历史请查 DB）
 func (a *AIHelper) GetMessages() []*model.Message {
 	window := a.memory.Window()

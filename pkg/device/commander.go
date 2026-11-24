@@ -38,6 +38,18 @@ type Outcome struct {
 	Latency time.Duration
 }
 
+// pendingReq 挂起中的请求：回执必须同时命中 req_id 与设备，才允许投递
+type pendingReq struct {
+	ch       chan devproto.ActuatorStatus
+	deviceID string
+}
+
+// nodeEntry 节点在线状态及最后应用的连接代次（用于丢弃旧连接迟到的遗嘱）
+type nodeEntry struct {
+	state NodeState
+	conn  string
+}
+
 // Commander 指令下发与回执匹配
 type Commander struct {
 	reg     *Registry
@@ -47,8 +59,8 @@ type Commander struct {
 	newID   func() string
 
 	mu      sync.Mutex
-	pending map[string]chan devproto.ActuatorStatus
-	nodes   map[string]NodeState
+	pending map[string]*pendingReq
+	nodes   map[string]nodeEntry
 }
 
 // CommanderOption 可选配置
@@ -81,8 +93,8 @@ func NewCommander(reg *Registry, pub Publisher, opts ...CommanderOption) *Comman
 		timeout: DefaultTimeout,
 		logger:  slog.Default(),
 		newID:   uuid.NewString,
-		pending: map[string]chan devproto.ActuatorStatus{},
-		nodes:   map[string]NodeState{},
+		pending: map[string]*pendingReq{},
+		nodes:   map[string]nodeEntry{},
 	}
 	for _, o := range opts {
 		o(c)
@@ -97,8 +109,8 @@ func (c *Commander) Registry() *Registry { return c.reg }
 func (c *Commander) NodeState(nodeID string) NodeState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if s, ok := c.nodes[nodeID]; ok {
-		return s
+	if e, ok := c.nodes[nodeID]; ok {
+		return e.state
 	}
 	return NodeUnknown
 }
@@ -141,7 +153,7 @@ func (c *Commander) Execute(ctx context.Context, req Request) (out Outcome, err 
 
 	ch := make(chan devproto.ActuatorStatus, 1)
 	c.mu.Lock()
-	c.pending[reqID] = ch
+	c.pending[reqID] = &pendingReq{ch: ch, deviceID: dev.ID}
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
@@ -184,33 +196,54 @@ func (c *Commander) HandleStatus(topic string, payload []byte) {
 		return
 	}
 	if _, ok := c.reg.Get(id); ok {
-		c.handleActuator(payload)
+		c.handleActuator(id, payload)
 	}
 }
 
 func (c *Commander) handleNode(id string, payload []byte) {
-	var st devproto.NodeStatus
+	// online 用指针解析：字段缺失（如误发到节点 topic 的其他消息）时保持原状态，不误判离线
+	var st struct {
+		Online *bool   `json:"online"`
+		Reason string  `json:"reason"`
+		Conn   string  `json:"conn"`
+	}
 	if err := json.Unmarshal(payload, &st); err != nil {
 		c.logger.Warn("invalid node status", "node", id, "err", err)
 		return
 	}
+	if st.Online == nil {
+		c.logger.Warn("node status without online field ignored", "node", id)
+		return
+	}
+
+	c.mu.Lock()
+	if !*st.Online {
+		// 离线消息的连接代次与当前记录不一致：这是旧连接迟到到达的遗嘱，丢弃，
+		// 避免覆盖同 ClientID 新连接的在线状态。任一侧为空（旧固件）时不启用该保护
+		if e, ok := c.nodes[id]; ok && e.conn != "" && st.Conn != "" && e.conn != st.Conn {
+			c.mu.Unlock()
+			c.logger.Warn("stale node status from old connection dropped",
+				"node", id, "msg_conn", st.Conn, "current_conn", e.conn, "reason", st.Reason)
+			return
+		}
+	}
 	state := NodeOffline
-	if st.Online {
+	if *st.Online {
 		state = NodeOnline
 	}
-	c.mu.Lock()
-	c.nodes[id] = state
+	c.nodes[id] = nodeEntry{state: state, conn: st.Conn}
 	c.mu.Unlock()
 	c.logger.Info("node_status", "node", id, "state", string(state), "reason", st.Reason)
 }
 
-func (c *Commander) handleActuator(payload []byte) {
+// handleActuator 校验回执来源设备后投递给挂起请求；topic 与 payload 任一不匹配即丢弃
+func (c *Commander) handleActuator(topicID string, payload []byte) {
 	var st devproto.ActuatorStatus
 	if err := json.Unmarshal(payload, &st); err != nil || st.ReqID == "" {
 		return
 	}
 	c.mu.Lock()
-	ch, ok := c.pending[st.ReqID]
+	req, ok := c.pending[st.ReqID]
 	c.mu.Unlock()
 	if !ok {
 		// 不在挂起表：请求已超时/已结束，或为 Retain 旧回执，一律丢弃
@@ -218,8 +251,20 @@ func (c *Commander) handleActuator(payload []byte) {
 			"device_id", st.DeviceID, "req_id", st.ReqID, "action", st.Action)
 		return
 	}
+	if req.deviceID != topicID {
+		// 回执发布在别的设备 topic 上：req_id 命中但设备不符，可能是发错 topic 或异常发布者
+		c.logger.Warn("drop status from wrong device topic",
+			"topic_device", topicID, "expected_device", req.deviceID, "req_id", st.ReqID)
+		return
+	}
+	if st.DeviceID != "" && st.DeviceID != topicID {
+		// payload 声称的 device_id 与 topic 不一致
+		c.logger.Warn("drop status with mismatched device_id",
+			"topic_device", topicID, "payload_device", st.DeviceID, "req_id", st.ReqID)
+		return
+	}
 	select {
-	case ch <- st:
+	case req.ch <- st:
 	default:
 	}
 }

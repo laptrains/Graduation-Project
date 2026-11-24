@@ -60,6 +60,9 @@ type NodeStatus struct {
 	Reason  string   `json:"reason,omitempty"`
 	Devices []string `json:"devices,omitempty"`
 	TS      int64    `json:"ts,omitempty"`
+	// Conn 连接代次：节点每次进程启动/重连时生成新值，online 消息与遗嘱携带同一个值，
+	// 服务端据此丢弃旧连接迟到到达的遗嘱，避免覆盖新连接的在线状态。可为空（兼容旧固件，无此保护）
+	Conn string `json:"conn,omitempty"`
 }
 
 // SensorData 上行传感器数据，ts 为设备侧时间，仅作参考

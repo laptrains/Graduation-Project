@@ -9,6 +9,7 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/google/uuid"
 
 	"GopherAI/pkg/devproto"
 )
@@ -38,12 +39,15 @@ type simulator struct {
 	cfg    simulatorConfig
 	env    *environment
 	client mqtt.Client
+	// conn 连接代次：本进程启动时生成一次，online 消息与 Last Will 携带同一个值，
+	// 服务端据此丢弃旧进程/旧连接迟到到达的遗嘱（devproto.NodeStatus.Conn）
+	conn string
 }
 
 func newSimulator(cfg simulatorConfig, env *environment) *simulator {
-	s := &simulator{cfg: cfg, env: env}
+	s := &simulator{cfg: cfg, env: env, conn: newConnID()}
 
-	will, _ := json.Marshal(devproto.NodeStatus{Online: false, Reason: devproto.ReasonUnexpected})
+	will, _ := json.Marshal(devproto.NodeStatus{Online: false, Reason: devproto.ReasonUnexpected, Conn: s.conn})
 	opts := mqtt.NewClientOptions().
 		AddBroker(cfg.Broker).
 		SetClientID(cfg.NodeID).
@@ -90,6 +94,7 @@ func (s *simulator) Shutdown() {
 		s.publishJSON(devproto.StatusTopic(s.cfg.NodeID), devproto.QoSStatus, true, devproto.NodeStatus{
 			Online: false,
 			Reason: devproto.ReasonGraceful,
+			Conn:   s.conn,
 			TS:     time.Now().Unix(),
 		})
 	}
@@ -113,11 +118,17 @@ func (s *simulator) onConnect(c mqtt.Client) {
 	s.publishJSON(devproto.StatusTopic(s.cfg.NodeID), devproto.QoSStatus, true, devproto.NodeStatus{
 		Online:  true,
 		Devices: allDeviceIDs,
+		Conn:    s.conn,
 		TS:      time.Now().Unix(),
 	})
 	for _, id := range actuatorIDs {
 		s.publishJSON(devproto.StatusTopic(id), devproto.QoSStatus, true, buildStatus(id, command{}, s.env.state(id), nil))
 	}
+}
+
+// newConnID 生成连接代次：进程内随机且稳定，进程间唯一
+func newConnID() string {
+	return uuid.NewString()
 }
 
 func (s *simulator) onCommand(_ mqtt.Client, msg mqtt.Message) {

@@ -268,22 +268,22 @@ func (m *MCPModel) discoverTools(ctx context.Context) ([]*schema.ToolInfo, error
 	return tools, nil
 }
 
-// bindTools 将发现的工具绑定到模型；发现或绑定失败时降级为普通对话
-func (m *MCPModel) bindTools(ctx context.Context) (model.ToolCallingChatModel, bool) {
+// bindTools 将发现的工具绑定到模型。
+// 发现或绑定失败时返回错误而非静默降级为普通聊天：
+// 设备控制模式下"降级继续聊"会导致未执行任何工具却对用户声称操作成功（幻觉）。
+func (m *MCPModel) bindTools(ctx context.Context) (model.ToolCallingChatModel, error) {
 	tools, err := m.discoverTools(ctx)
 	if err != nil {
-		log.Printf("[mcp] tool discovery failed, fallback to plain chat: %v", err)
-		return m.llm, false
+		return nil, fmt.Errorf("MCP 工具服务不可用，设备控制模式无法工作：%w", err)
 	}
 	if len(tools) == 0 {
-		return m.llm, false
+		return nil, fmt.Errorf("MCP 工具服务未暴露任何工具，设备控制模式无法工作")
 	}
 	bound, err := m.llm.WithTools(tools)
 	if err != nil {
-		log.Printf("[mcp] bind tools failed, fallback to plain chat: %v", err)
-		return m.llm, false
+		return nil, fmt.Errorf("MCP 工具绑定失败，设备控制模式无法工作：%w", err)
 	}
-	return bound, true
+	return bound, nil
 }
 
 // toolInfoFromMCP 把 MCP 工具定义转换为 eino ToolInfo，保留枚举、范围与必填约束
@@ -317,11 +317,11 @@ func (m *MCPModel) GenerateResponse(ctx context.Context, messages []*schema.Mess
 		return nil, fmt.Errorf("no messages provided")
 	}
 
-	llm, hasTools := m.bindTools(ctx)
-	msgs := append([]*schema.Message(nil), messages...)
-	if hasTools {
-		msgs = withToolSystemPrompt(msgs)
+	llm, err := m.bindTools(ctx)
+	if err != nil {
+		return nil, err
 	}
+	msgs := withToolSystemPrompt(append([]*schema.Message(nil), messages...))
 
 	for round := 0; ; round++ {
 		resp, err := llm.Generate(ctx, msgs)
@@ -345,11 +345,11 @@ func (m *MCPModel) StreamResponse(ctx context.Context, messages []*schema.Messag
 		return "", fmt.Errorf("no messages provided")
 	}
 
-	llm, hasTools := m.bindTools(ctx)
-	msgs := append([]*schema.Message(nil), messages...)
-	if hasTools {
-		msgs = withToolSystemPrompt(msgs)
+	llm, err := m.bindTools(ctx)
+	if err != nil {
+		return "", err
 	}
+	msgs := withToolSystemPrompt(append([]*schema.Message(nil), messages...))
 
 	for round := 0; ; round++ {
 		stream, err := llm.Stream(ctx, msgs)
